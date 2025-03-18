@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use itertools::Itertools;
+use powdr_ast::analyzed::AlgebraicReference;
+use powdr_ast::analyzed::AlgebraicReferenceThin;
+use powdr_ast::analyzed::PolynomialType;
 
 use super::block_machine::BlockMachine;
 use super::double_sorted_witness_machine_16::DoubleSortedWitnesses16;
@@ -13,8 +17,8 @@ use super::Machine;
 use crate::witgen::data_structures::identity::Identity;
 use crate::witgen::machines::dynamic_machine::DynamicMachine;
 use crate::witgen::machines::second_stage_machine::SecondStageMachine;
-use crate::witgen::machines::Connection;
 use crate::witgen::machines::{write_once_memory::WriteOnceMemory, MachineParts};
+use powdr_ast::analyzed::AlgebraicExpression;
 
 use powdr_ast::analyzed::{
     self, AlgebraicExpression as Expression, PolyID, PolynomialReference, Reference,
@@ -62,6 +66,12 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
                 Default::default(),
                 self.fixed.identities.iter().collect(),
                 self.fixed.witness_cols.keys().collect::<HashSet<_>>(),
+                self.fixed
+                    .analyzed
+                    .intermediate_columns
+                    .iter()
+                    .map(|(name, (s, _))| (s.into(), name.clone()))
+                    .collect(),
                 prover_functions,
             );
 
@@ -79,30 +89,29 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
         let mut extracted_prover_functions = HashSet::new();
         let mut id_counter = 0;
 
-        let all_connections = self
-            .fixed
-            .identities
-            .iter()
-            .filter_map(|i| Connection::try_new(i, &self.fixed.bus_receives))
-            .collect::<Vec<_>>();
+        let mut fixed_lookup_receives = BTreeMap::new();
 
-        let mut fixed_lookup_connections = BTreeMap::new();
-
-        for connection in &all_connections {
+        for bus_receive in self.fixed.bus_receives.values() {
             // If the RHS only consists of fixed columns, record the connection and continue.
-            if FixedLookup::is_responsible(connection) {
-                assert!(fixed_lookup_connections
-                    .insert(connection.id, *connection)
+            if FixedLookup::is_responsible(bus_receive) {
+                assert!(fixed_lookup_receives
+                    .insert(bus_receive.bus_id, bus_receive)
                     .is_none());
-                if let Some(multiplicity) = connection.multiplicity_column {
-                    remaining_witnesses.remove(&multiplicity);
+                if let Some(multiplicity) = &bus_receive.multiplicity {
+                    let poly_id = match multiplicity {
+                        Expression::Reference(reference) => reference.poly_id,
+                        _ => panic!(
+                            "For fixed lookup, expected simple multiplicity, got: {multiplicity}"
+                        ),
+                    };
+                    remaining_witnesses.remove(&poly_id);
                 }
                 continue;
             }
 
-            // Extract all witness columns in the RHS of the lookup.
+            // Extract all witness columns in the bus receive.
             let lookup_witnesses =
-                &self.refs_in_connection_rhs(connection) & (&remaining_witnesses);
+                &self.fixed.polynomial_references(bus_receive) & (&remaining_witnesses);
             if lookup_witnesses.is_empty() {
                 // Skip connections to machines that were already created or point to FixedLookup.
                 continue;
@@ -129,18 +138,29 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
             publics.add_all(machine_identities.as_slice()).unwrap();
 
             // Connections that call into the current machine
-            let machine_connections = all_connections
-                .iter()
-                .filter_map(|connection| {
+            let machine_receives = self
+                .fixed
+                .bus_receives
+                .values()
+                .filter_map(|bus_receive| {
                     // check if the identity connects to the current machine
-                    self.refs_in_connection_rhs(connection)
+                    self.fixed
+                        .polynomial_references(bus_receive)
                         .intersection(&machine_witnesses)
                         .next()
                         .is_some()
-                        .then_some((connection.id, *connection))
+                        .then_some((bus_receive.bus_id, bus_receive))
                 })
                 .collect::<BTreeMap<_, _>>();
-            assert!(machine_connections.contains_key(&connection.id));
+            assert!(machine_receives.contains_key(&bus_receive.bus_id));
+
+            let machine_intermediates = intermediates_in_expressions(
+                machine_identities
+                    .iter()
+                    .flat_map(|i| i.all_children())
+                    .chain(machine_receives.values().flat_map(|r| r.all_children())),
+                &self.fixed.intermediate_definitions,
+            );
 
             let prover_functions = prover_functions
                 .iter()
@@ -165,9 +185,10 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
 
             let machine_parts = MachineParts::new(
                 self.fixed,
-                machine_connections,
+                machine_receives,
                 machine_identities,
                 machine_witnesses,
+                machine_intermediates,
                 prover_functions.iter().map(|&(_, pf)| pf).collect(),
             );
 
@@ -193,7 +214,7 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
         let fixed_lookup = FixedLookup::new(
             self.fixed.global_range_constraints().clone(),
             self.fixed,
-            fixed_lookup_connections,
+            fixed_lookup_receives,
         );
 
         machines.push(KnownMachine::FixedLookup(fixed_lookup));
@@ -224,6 +245,10 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
             .difference(&multiplicity_columns)
             .cloned()
             .collect::<HashSet<_>>();
+        let main_intermediates = intermediates_in_expressions(
+            base_identities.iter().flat_map(|i| i.all_children()),
+            &self.fixed.intermediate_definitions,
+        );
 
         log::trace!(
             "\nThe base machine contains the following witnesses:\n{}\n identities:\n{}\n and prover functions:\n{}",
@@ -241,6 +266,7 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
             Default::default(),
             base_identities,
             main_witnesses,
+            main_intermediates,
             base_prover_functions,
         );
 
@@ -287,15 +313,6 @@ impl<'a, T: FieldElement> MachineExtractor<'a, T> {
             }
         }
     }
-
-    /// Like refs_in_selected_expressions(connection.right), but also includes the multiplicity column.
-    fn refs_in_connection_rhs(&self, connection: &Connection<T>) -> HashSet<PolyID> {
-        self.fixed
-            .polynomial_references(connection.right)
-            .into_iter()
-            .chain(connection.multiplicity_column)
-            .collect()
-    }
 }
 
 fn extract_namespace(name: &str) -> &str {
@@ -316,7 +333,7 @@ fn log_extracted_machine<T: FieldElement>(name: &str, parts: &MachineParts<'_, T
     };
     log::log!(
         log_level,
-        "\nExtracted a machine {name} with the following witnesses:\n{}\n identities:\n{}\n connecting identities:\n{}\n and prover functions:\n{}",
+        "\nExtracted a machine {name} with the following witnesses:\n{}\n identities:\n{}\n bus receives:\n{}\n and prover functions:\n{}",
         parts.witnesses
             .iter()
             .map(|s|parts.column_name(s))
@@ -325,7 +342,7 @@ fn log_extracted_machine<T: FieldElement>(name: &str, parts: &MachineParts<'_, T
         parts.identities
             .iter()
             .format("\n"),
-        parts.connections
+        parts.bus_receives
             .values()
             .format("\n"),
         parts.prover_functions
@@ -429,11 +446,11 @@ fn build_machine<'a, T: FieldElement>(
         log::debug!("Detected machine: Dynamic machine.");
         // If there is a connection to this machine, all connections must have the same latch.
         // If there is no connection to this machine, it is the main machine and there is no latch.
-        let latch = machine_parts.connections
+        let latch = machine_parts.bus_receives
             .values()
-            .fold(None, |existing_latch, identity| {
-                let current_latch = &identity
-                    .right
+            .fold(None, |existing_latch, receive| {
+                let current_latch = &receive
+                    .selected_payload
                     .selector;
                 if let Some(existing_latch) = existing_latch {
                     assert_eq!(
@@ -466,4 +483,37 @@ fn refs_in_parsed_expression(expr: &analyzed::Expression) -> impl Iterator<Item 
         }
         _ => None,
     })
+}
+
+fn try_as_intermediate_ref<T: FieldElement>(expr: &Expression<T>) -> Option<(PolyID, String)> {
+    match expr {
+        Expression::Reference(AlgebraicReference { poly_id, name, .. }) => {
+            (poly_id.ptype == PolynomialType::Intermediate).then(|| (*poly_id, name.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Returns all intermediate columns referenced in the expression as a map to their name.
+/// Follows intermediate references recursively.
+fn intermediates_in_expressions<'a, T: FieldElement>(
+    expressions: impl Iterator<Item = &'a AlgebraicExpression<T>>,
+    intermediate_definitions: &BTreeMap<AlgebraicReferenceThin, Expression<T>>,
+) -> HashMap<PolyID, String> {
+    let mut queue = expressions
+        .filter_map(try_as_intermediate_ref)
+        .collect::<BTreeSet<_>>();
+    let mut intermediates = HashMap::new();
+    while let Some((poly_id, name)) = queue.pop_first() {
+        intermediates.insert(poly_id, name.clone());
+        for (ref_id, ref_name) in intermediate_definitions[&poly_id.into()]
+            .all_children()
+            .filter_map(try_as_intermediate_ref)
+        {
+            if intermediates.insert(ref_id, ref_name.clone()).is_none() {
+                queue.insert((ref_id, ref_name));
+            }
+        }
+    }
+    intermediates
 }
