@@ -1,22 +1,28 @@
 use std::cmp::Ordering;
-
+use std::hash::Hash;
 use std::iter;
 
 use bit_vec::BitVec;
 use itertools::Itertools;
 use powdr_ast::indent;
+use powdr_constraint_solver::effect::{
+    Assertion, BitDecomposition, BitDecompositionComponent, Condition,
+};
+use powdr_constraint_solver::symbolic_expression::SymbolicExpression;
 use powdr_number::FieldElement;
-use std::hash::Hash;
 
-use crate::witgen::range_constraints::RangeConstraint;
+use powdr_constraint_solver::effect::Effect as ConstraintSolverEffect;
+use powdr_constraint_solver::range_constraint::RangeConstraint;
 
-use super::{symbolic_expression::SymbolicExpression, variable::Variable};
+use super::variable::Variable;
 
 /// The effect of solving a symbolic equation.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Effect<T: FieldElement, V> {
     /// Variable can be assigned a value.
     Assignment(V, SymbolicExpression<T, V>),
+    /// Perform a bit decomposition of a known value, and assign multiple variables.
+    BitDecomposition(BitDecomposition<T, V>),
     /// We learnt a new range constraint on variable.
     RangeConstraint(V, RangeConstraint<T>),
     /// A run-time assertion. If this fails, we have conflicting constraints.
@@ -26,25 +32,53 @@ pub enum Effect<T: FieldElement, V> {
     /// Compute one variable by executing a prover function (given by index) on the value of other variables.
     ProverFunctionCall(ProverFunctionCall<V>),
     /// A branch on a variable.
-    Branch(BranchCondition<T, V>, Vec<Effect<T, V>>, Vec<Effect<T, V>>),
+    Branch(Condition<T, V>, Vec<Effect<T, V>>, Vec<Effect<T, V>>),
+}
+
+impl<T: FieldElement, V: Clone> From<ConstraintSolverEffect<T, V>> for Effect<T, V> {
+    fn from(effect: ConstraintSolverEffect<T, V>) -> Self {
+        match effect {
+            ConstraintSolverEffect::Assignment(v, expr) => Effect::Assignment(v, expr),
+            ConstraintSolverEffect::RangeConstraint(v, range) => Effect::RangeConstraint(v, range),
+            ConstraintSolverEffect::BitDecomposition(bit_decomp) => {
+                Effect::BitDecomposition(bit_decomp)
+            }
+            ConstraintSolverEffect::Assertion(assertion) => Effect::Assertion(assertion),
+            ConstraintSolverEffect::ConditionalAssignment {
+                variable,
+                condition,
+                in_range_value,
+                out_of_range_value,
+            } => Effect::Branch(
+                condition,
+                vec![Effect::Assignment(variable.clone(), in_range_value)],
+                vec![Effect::Assignment(variable, out_of_range_value)],
+            ),
+        }
+    }
 }
 
 impl<T: FieldElement> Effect<T, Variable> {
     /// Returns an iterator over all variables written to in the effect.
     /// The flag indicates if the variable is the return value of a machine call and thus needs
     /// to be declared mutable.
-    pub fn written_vars(&self) -> Box<dyn Iterator<Item = (&Variable, bool)> + '_> {
+    pub fn written_vars(&self) -> Box<dyn Iterator<Item = &Variable> + '_> {
         match self {
-            Effect::Assignment(var, _) => Box::new(iter::once((var, false))),
+            Effect::Assignment(var, _) => Box::new(iter::once(var)),
             Effect::RangeConstraint(..) => unreachable!(),
+            Effect::BitDecomposition(BitDecomposition { components, .. }) => Box::new(
+                components
+                    .iter()
+                    .map(|BitDecompositionComponent { variable, .. }| variable),
+            ),
             Effect::Assertion(..) => Box::new(iter::empty()),
             Effect::MachineCall(_, known, vars) => Box::new(
                 vars.iter()
                     .zip_eq(known)
-                    .flat_map(|(v, known)| (!known).then_some((v, true))),
+                    .flat_map(|(v, known)| (!known).then_some(v)),
             ),
             Effect::ProverFunctionCall(ProverFunctionCall { targets, .. }) => {
-                Box::new(targets.iter().map(|v| (v, false)))
+                Box::new(targets.iter())
             }
             Effect::Branch(_, first, second) => {
                 Box::new(first.iter().chain(second).flat_map(|e| e.written_vars()))
@@ -59,6 +93,13 @@ impl<T: FieldElement, V: Hash + Eq> Effect<T, V> {
         let iter: Box<dyn Iterator<Item = &V>> = match self {
             Effect::Assignment(v, expr) => Box::new(iter::once(v).chain(expr.referenced_symbols())),
             Effect::RangeConstraint(v, _) => Box::new(iter::once(v)),
+            Effect::BitDecomposition(BitDecomposition { value, components }) => Box::new(
+                value.referenced_symbols().chain(
+                    components
+                        .iter()
+                        .map(|BitDecompositionComponent { variable, .. }| variable),
+                ),
+            ),
             Effect::Assertion(Assertion { lhs, rhs, .. }) => {
                 Box::new(lhs.referenced_symbols().chain(rhs.referenced_symbols()))
             }
@@ -67,7 +108,7 @@ impl<T: FieldElement, V: Hash + Eq> Effect<T, V> {
                 targets, inputs, ..
             }) => Box::new(targets.iter().chain(inputs)),
             Effect::Branch(branch_condition, first, second) => Box::new(
-                iter::once(&branch_condition.variable).chain(
+                branch_condition.value.referenced_symbols().chain(
                     [first, second]
                         .into_iter()
                         .flatten()
@@ -77,48 +118,6 @@ impl<T: FieldElement, V: Hash + Eq> Effect<T, V> {
         };
         iter.unique()
     }
-}
-
-/// A run-time assertion. If this fails, we have conflicting constraints.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Assertion<T: FieldElement, V> {
-    pub lhs: SymbolicExpression<T, V>,
-    pub rhs: SymbolicExpression<T, V>,
-    /// If this is true, we assert that both sides are equal.
-    /// Otherwise, we assert that they are different.
-    pub expected_equal: bool,
-}
-
-impl<T: FieldElement, V> Assertion<T, V> {
-    pub fn assert_is_zero(condition: SymbolicExpression<T, V>) -> Effect<T, V> {
-        Self::assert_eq(condition, SymbolicExpression::from(T::from(0)))
-    }
-    pub fn assert_is_nonzero(condition: SymbolicExpression<T, V>) -> Effect<T, V> {
-        Self::assert_neq(condition, SymbolicExpression::from(T::from(0)))
-    }
-    pub fn assert_eq(lhs: SymbolicExpression<T, V>, rhs: SymbolicExpression<T, V>) -> Effect<T, V> {
-        Effect::Assertion(Assertion {
-            lhs,
-            rhs,
-            expected_equal: true,
-        })
-    }
-    pub fn assert_neq(
-        lhs: SymbolicExpression<T, V>,
-        rhs: SymbolicExpression<T, V>,
-    ) -> Effect<T, V> {
-        Effect::Assertion(Assertion {
-            lhs,
-            rhs,
-            expected_equal: false,
-        })
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct BranchCondition<T: FieldElement, V> {
-    pub variable: V,
-    pub condition: RangeConstraint<T>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -139,6 +138,7 @@ pub fn format_code<T: FieldElement>(effects: &[Effect<T, Variable>]) -> String {
         .iter()
         .map(|effect| match effect {
             Effect::Assignment(v, expr) => format!("{v} = {expr};"),
+            Effect::BitDecomposition(bit_decomp) => format!("{bit_decomp}"),
             Effect::Assertion(Assertion {
                 lhs,
                 rhs,
@@ -200,21 +200,19 @@ pub fn format_code<T: FieldElement>(effects: &[Effect<T, Variable>]) -> String {
 }
 
 fn format_condition<T: FieldElement>(
-    BranchCondition {
-        variable,
-        condition,
-    }: &BranchCondition<T, Variable>,
+    Condition { value, condition }: &Condition<T, Variable>,
 ) -> String {
     let (min, max) = condition.range();
     match min.cmp(&max) {
-        Ordering::Equal => format!("{variable} == {min}"),
-        Ordering::Less => format!("{min} <= {variable} && {variable} <= {max}"),
-        Ordering::Greater => format!("{variable} <= {min} || {variable} >= {max}"),
+        Ordering::Equal => format!("{value} == {min}"),
+        Ordering::Less => format!("{min} <= {value} && {value} <= {max}"),
+        Ordering::Greater => format!("{value} <= {min} || {value} >= {max}"),
     }
 }
 
 #[cfg(test)]
 mod test {
+    use powdr_constraint_solver::effect::Condition;
     use powdr_number::GoldilocksField;
 
     use crate::witgen::jit::variable::Cell;
@@ -232,13 +230,17 @@ mod test {
         })
     }
 
+    fn var_as_expr(id: u64) -> SymbolicExpression<T, Variable> {
+        SymbolicExpression::from_symbol(var(id), Default::default())
+    }
+
     #[test]
     fn combine_if_else() {
         let effects = vec![
             Effect::Assignment(var(0), SymbolicExpression::from(T::from(1))),
             Effect::Branch(
-                BranchCondition {
-                    variable: var(0),
+                Condition {
+                    value: var_as_expr(0),
                     condition: RangeConstraint::from_range(T::from(1), T::from(2)),
                 },
                 vec![Effect::Assignment(
@@ -246,13 +248,13 @@ mod test {
                     SymbolicExpression::from(T::from(2)),
                 )],
                 vec![Effect::Branch(
-                    BranchCondition {
-                        variable: var(1),
+                    Condition {
+                        value: var_as_expr(1),
                         condition: RangeConstraint::from_range(T::from(5), T::from(6)),
                     },
                     vec![Effect::Branch(
-                        BranchCondition {
-                            variable: var(2),
+                        Condition {
+                            value: var_as_expr(2),
                             condition: RangeConstraint::from_range(T::from(5), T::from(6)),
                         },
                         vec![Effect::Assignment(
@@ -265,8 +267,8 @@ mod test {
                         )],
                     )],
                     vec![Effect::Branch(
-                        BranchCondition {
-                            variable: var(3),
+                        Condition {
+                            value: var_as_expr(3),
                             condition: RangeConstraint::from_range(T::from(5), T::from(6)),
                         },
                         vec![Effect::Assignment(

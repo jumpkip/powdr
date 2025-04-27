@@ -41,7 +41,6 @@ mod machines;
 mod multiplicity_column_generator;
 mod processor;
 mod query_processor;
-mod range_constraints;
 mod rows;
 mod sequence_iterator;
 mod util;
@@ -49,6 +48,9 @@ mod vm_processor;
 
 pub use affine_expression::{AffineExpression, AffineResult, AlgebraicVariable};
 pub use evaluators::partial_expression_evaluator::{PartialExpressionEvaluator, SymbolicVariables};
+
+pub type Witness<T> = Vec<(String, Vec<T>)>;
+pub type Publics<T> = BTreeMap<String, Option<T>>;
 
 static OUTER_CODE_NAME: &str = "witgen (outer code)";
 
@@ -108,7 +110,7 @@ impl<T: FieldElement> WitgenCallbackContext<T> {
         current_witness: &[(String, Vec<T>)],
         challenges: BTreeMap<u64, T>,
         stage: u8,
-    ) -> Vec<(String, Vec<T>)> {
+    ) -> (Witness<T>, Publics<T>) {
         let has_phantom_bus_sends = pil
             .identities
             .iter()
@@ -132,7 +134,10 @@ impl<T: FieldElement> WitgenCallbackContext<T> {
                 challenges,
             );
 
-            current_witness.iter().cloned().chain(bus_columns).collect()
+            (
+                current_witness.iter().cloned().chain(bus_columns).collect(),
+                BTreeMap::new(),
+            )
         } else {
             log::debug!("Using automatic stage-1 witgen.");
             let size = current_witness.iter().next().unwrap().1.len() as DegreeType;
@@ -202,7 +207,7 @@ impl<'a, 'b, T: FieldElement> WitnessGenerator<'a, 'b, T> {
 
     /// Generates the committed polynomial values
     /// @returns the values (in source order) and the degree of the polynomials.
-    pub fn generate(self) -> Vec<(String, Vec<T>)> {
+    pub fn generate(self) -> (Witness<T>, Publics<T>) {
         record_start(OUTER_CODE_NAME);
         let fixed = FixedData::new(
             self.analyzed,
@@ -241,7 +246,8 @@ impl<'a, 'b, T: FieldElement> WitnessGenerator<'a, 'b, T> {
         let machines = MachineExtractor::new(&fixed).split_out_machines();
 
         // Run main machine and extract columns from all machines.
-        let columns = MutableState::new(machines.into_iter(), &self.query_callback).run();
+        let (columns, _publics) =
+            MutableState::new(machines.into_iter(), &self.query_callback).run();
 
         let publics = extract_publics(&columns, self.analyzed);
         if !publics.is_empty() {
@@ -258,7 +264,7 @@ impl<'a, 'b, T: FieldElement> WitnessGenerator<'a, 'b, T> {
 
         let mut columns = if self.stage == 0 {
             // Multiplicities should be computed in the first stage
-            MultiplicityColumnGenerator::new(&fixed).generate(columns, publics)
+            MultiplicityColumnGenerator::new(&fixed).generate(columns, publics.clone())
         } else {
             columns
         };
@@ -279,7 +285,8 @@ impl<'a, 'b, T: FieldElement> WitnessGenerator<'a, 'b, T> {
                 (name, column)
             })
             .collect::<Vec<_>>();
-        witness_cols
+
+        (witness_cols, publics)
     }
 }
 
@@ -314,6 +321,7 @@ pub struct FixedData<'a, T: FieldElement> {
     bus_receives: BTreeMap<T, BusReceive<T>>,
     fixed_cols: FixedColumnMap<FixedColumn<'a, T>>,
     witness_cols: WitnessColumnMap<WitnessColumn<'a, T>>,
+    /// A map from column name to PolyID, supports array elements.
     column_by_name: HashMap<String, PolyID>,
     challenges: BTreeMap<u64, T>,
     global_range_constraints: GlobalConstraints<T>,
@@ -400,12 +408,7 @@ impl<'a, T: FieldElement> FixedData<'a, T> {
             bus_receives,
             fixed_cols,
             witness_cols,
-            column_by_name: analyzed
-                .definitions
-                .iter()
-                .filter(|(_, (symbol, _))| matches!(symbol.kind, SymbolKind::Poly(_)))
-                .flat_map(|(_, (symbol, _))| symbol.array_elements())
-                .collect(),
+            column_by_name: analyzed.name_to_poly_id().collect(),
             challenges,
             global_range_constraints,
             intermediate_definitions,
@@ -525,15 +528,10 @@ impl<'a, T: FieldElement> FixedData<'a, T> {
         }
     }
 
+    /// Returns a PolyID given the name of it. Supports array elements
+    /// in that for `"X[7]"` it returns the PolyID of element 7 of the array `X`.
     pub fn try_column_by_name(&self, name: &str) -> Option<PolyID> {
         self.column_by_name.get(name).cloned()
-    }
-
-    pub fn try_symbol_by_name(&self, name: &str) -> Option<&Symbol> {
-        self.analyzed
-            .definitions
-            .get(name)
-            .map(|(symbol, _)| symbol)
     }
 
     fn external_witness(&self, row: DegreeType, column: &PolyID) -> Option<T> {

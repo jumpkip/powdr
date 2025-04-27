@@ -10,6 +10,7 @@ members = [
     "cargo-powdr",
     "cli",
     "cli-rs",
+    "constraint-solver",
     "executor",
     "jit-compiler",
     "riscv",
@@ -27,7 +28,7 @@ members = [
     "isa-utils",
     "airgen",
     "riscv-executor",
-    "riscv-syscalls",
+    "syscalls",
     "schemas",
     "backend-utils",
     "executor-utils",
@@ -48,6 +49,7 @@ powdr = { path = "./powdr", version = "0.1.4" }
 powdr-airgen = { path = "./airgen", version = "0.1.4" }
 powdr-ast = { path = "./ast", version = "0.1.4" }
 powdr-asm-to-pil = { path = "./asm-to-pil", version = "0.1.4" }
+powdr-constraint-solver = { path = "./constraint-solver", version = "0.1.4" }
 powdr-isa-utils = { path = "./isa-utils", version = "0.1.4" }
 powdr-analysis = { path = "./analysis", version = "0.1.4" }
 powdr-asmopt = { path = "./asmopt", version = "0.1.4" }
@@ -67,7 +69,7 @@ powdr-pipeline = { path = "./pipeline", version = "0.1.4" }
 powdr-plonky3 = { path = "./plonky3", version = "0.1.4" }
 powdr-riscv = { path = "./riscv", version = "0.1.4" }
 powdr-riscv-executor = { path = "./riscv-executor", version = "0.1.4" }
-powdr-riscv-syscalls = { path = "./riscv-syscalls", version = "0.1.4" }
+powdr-syscalls = { path = "./syscalls", version = "0.1.4" }
 powdr-schemas = { path = "./schemas", version = "0.1.4" }
 
 [profile.pr-tests]

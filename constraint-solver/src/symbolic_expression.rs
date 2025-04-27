@@ -1,17 +1,19 @@
 use auto_enums::auto_enum;
 use itertools::Itertools;
-use num_traits::Zero;
-use powdr_ast::parsed::visitor::AllChildren;
-use powdr_number::FieldElement;
 use std::hash::Hash;
+use std::ops::Sub;
+use std::ops::{AddAssign, MulAssign};
 use std::{
     fmt::{self, Display, Formatter},
     iter,
-    ops::{Add, BitAnd, Mul, Neg},
+    ops::{Add, Mul, Neg},
     sync::Arc,
 };
 
-use crate::witgen::range_constraints::RangeConstraint;
+use powdr_number::FieldElement;
+
+use super::range_constraint::RangeConstraint;
+use super::variable_update::VariableUpdate;
 
 /// A value that is known at run-time, defined through a complex expression
 /// involving known cells or variables and compile-time constants.
@@ -25,23 +27,15 @@ pub enum SymbolicExpression<T: FieldElement, S> {
     Symbol(S, RangeConstraint<T>),
     BinaryOperation(Arc<Self>, BinaryOperator, Arc<Self>, RangeConstraint<T>),
     UnaryOperation(UnaryOperator, Arc<Self>, RangeConstraint<T>),
-    BitOperation(Arc<Self>, BitOperator, T::Integer, RangeConstraint<T>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
     Add,
     Sub,
     Mul,
     /// Finite field division.
     Div,
-    /// Integer division, i.e. convert field elements to unsigned integer and divide.
-    IntegerDiv,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BitOperator {
-    And,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,22 +53,25 @@ impl<T: FieldElement, S> SymbolicExpression<T, S> {
             SymbolicExpression::BinaryOperation(lhs, _, rhs, _) => {
                 [lhs.as_ref(), rhs.as_ref()].into_iter()
             }
-            SymbolicExpression::UnaryOperation(_, expr, _)
-            | SymbolicExpression::BitOperation(expr, _, _, _) => iter::once(expr.as_ref()),
+            SymbolicExpression::UnaryOperation(_, expr, _) => iter::once(expr.as_ref()),
             SymbolicExpression::Concrete(_) | SymbolicExpression::Symbol(..) => iter::empty(),
         }
     }
-}
 
-impl<T: FieldElement, S> AllChildren<SymbolicExpression<T, S>> for SymbolicExpression<T, S> {
-    fn all_children(&self) -> Box<dyn Iterator<Item = &SymbolicExpression<T, S>> + '_> {
+    /// Returns an iterator over all direct and indirect children of this expression, including
+    /// the expression itself.
+    pub fn all_children(&self) -> Box<dyn Iterator<Item = &SymbolicExpression<T, S>> + '_> {
         Box::new(iter::once(self).chain(self.children().flat_map(|e| e.all_children())))
     }
 }
 
 impl<T: FieldElement, S> SymbolicExpression<T, S> {
     pub fn from_symbol(symbol: S, rc: RangeConstraint<T>) -> Self {
-        SymbolicExpression::Symbol(symbol, rc)
+        if let Some(v) = rc.try_to_single_value() {
+            SymbolicExpression::Concrete(v)
+        } else {
+            SymbolicExpression::Symbol(symbol, rc)
+        }
     }
 
     pub fn is_known_zero(&self) -> bool {
@@ -100,8 +97,7 @@ impl<T: FieldElement, S> SymbolicExpression<T, S> {
             SymbolicExpression::Concrete(v) => RangeConstraint::from_value(*v),
             SymbolicExpression::Symbol(.., rc)
             | SymbolicExpression::BinaryOperation(.., rc)
-            | SymbolicExpression::UnaryOperation(.., rc)
-            | SymbolicExpression::BitOperation(.., rc) => rc.clone(),
+            | SymbolicExpression::UnaryOperation(.., rc) => rc.clone(),
         }
     }
 
@@ -110,8 +106,56 @@ impl<T: FieldElement, S> SymbolicExpression<T, S> {
             SymbolicExpression::Concrete(n) => Some(*n),
             SymbolicExpression::Symbol(..)
             | SymbolicExpression::BinaryOperation(..)
-            | SymbolicExpression::UnaryOperation(..)
-            | SymbolicExpression::BitOperation(..) => None,
+            | SymbolicExpression::UnaryOperation(..) => None,
+        }
+    }
+}
+
+impl<T: FieldElement, S: Clone + Eq> SymbolicExpression<T, S> {
+    /// Applies a variable update and returns a modified version if there was a change.
+    pub fn compute_updated(&self, variable_update: &VariableUpdate<T, S>) -> Option<Self> {
+        match self {
+            SymbolicExpression::Concrete(_) => None,
+            SymbolicExpression::Symbol(v, _) => {
+                if *v == variable_update.variable {
+                    assert!(variable_update.known);
+                    Some(SymbolicExpression::from_symbol(
+                        v.clone(),
+                        variable_update.range_constraint.clone(),
+                    ))
+                } else {
+                    None
+                }
+            }
+            SymbolicExpression::BinaryOperation(left, op, right, _) => {
+                let (l, r) = match (
+                    left.compute_updated(variable_update),
+                    right.compute_updated(variable_update),
+                ) {
+                    (None, None) => return None,
+                    (Some(l), None) => (l, (**right).clone()),
+                    (None, Some(r)) => ((**left).clone(), r),
+                    (Some(l), Some(r)) => (l, r),
+                };
+                match op {
+                    BinaryOperator::Add => Some(l + r),
+                    BinaryOperator::Sub => Some(l - r),
+                    BinaryOperator::Mul => Some(l * r),
+                    BinaryOperator::Div => Some(l.field_div(&r)),
+                }
+            }
+            SymbolicExpression::UnaryOperation(op, inner, _) => {
+                let inner = inner.compute_updated(variable_update)?;
+                assert!(matches!(op, UnaryOperator::Neg));
+                Some(-inner)
+            }
+        }
+    }
+
+    /// Applies a variable update in place.
+    pub fn apply_update(&mut self, variable_update: &VariableUpdate<T, S>) {
+        if let Some(updated) = self.compute_updated(variable_update) {
+            *self = updated;
         }
     }
 }
@@ -143,9 +187,6 @@ impl<T: FieldElement, V: Display> Display for SymbolicExpression<T, V> {
                 write!(f, "({lhs} {op} {rhs})")
             }
             SymbolicExpression::UnaryOperation(op, expr, _) => write!(f, "{op}{expr}"),
-            SymbolicExpression::BitOperation(expr, op, n, _) => {
-                write!(f, "({expr} {op} {n:#x})")
-            }
         }
     }
 }
@@ -157,7 +198,6 @@ impl Display for BinaryOperator {
             BinaryOperator::Sub => write!(f, "-"),
             BinaryOperator::Mul => write!(f, "*"),
             BinaryOperator::Div => write!(f, "/"),
-            BinaryOperator::IntegerDiv => write!(f, "//"),
         }
     }
 }
@@ -166,14 +206,6 @@ impl Display for UnaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             UnaryOperator::Neg => write!(f, "-"),
-        }
-    }
-}
-
-impl Display for BitOperator {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            BitOperator::And => write!(f, "&"),
         }
     }
 }
@@ -215,6 +247,44 @@ impl<T: FieldElement, V: Clone> Add for SymbolicExpression<T, V> {
     }
 }
 
+impl<T: FieldElement, V: Clone> AddAssign for SymbolicExpression<T, V> {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = self.clone() + rhs;
+    }
+}
+
+impl<T: FieldElement, V: Clone> Sub for &SymbolicExpression<T, V> {
+    type Output = SymbolicExpression<T, V>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        if self.is_known_zero() {
+            return -rhs.clone();
+        }
+        if rhs.is_known_zero() {
+            return self.clone();
+        }
+        match (self, rhs) {
+            (SymbolicExpression::Concrete(a), SymbolicExpression::Concrete(b)) => {
+                SymbolicExpression::Concrete(*a - *b)
+            }
+            _ => SymbolicExpression::BinaryOperation(
+                Arc::new(self.clone()),
+                BinaryOperator::Sub,
+                Arc::new(rhs.clone()),
+                self.range_constraint()
+                    .combine_sum(&rhs.range_constraint().neg()),
+            ),
+        }
+    }
+}
+
+impl<T: FieldElement, V: Clone> Sub for SymbolicExpression<T, V> {
+    type Output = SymbolicExpression<T, V>;
+    fn sub(self, rhs: Self) -> Self::Output {
+        &self - &rhs
+    }
+}
+
 impl<T: FieldElement, V: Clone> Neg for &SymbolicExpression<T, V> {
     type Output = SymbolicExpression<T, V>;
 
@@ -223,6 +293,37 @@ impl<T: FieldElement, V: Clone> Neg for &SymbolicExpression<T, V> {
             SymbolicExpression::Concrete(n) => SymbolicExpression::Concrete(-*n),
             SymbolicExpression::UnaryOperation(UnaryOperator::Neg, expr, _) => {
                 expr.as_ref().clone()
+            }
+            SymbolicExpression::BinaryOperation(lhs, BinaryOperator::Add, rhs, _) => {
+                -(**lhs).clone() + -(**rhs).clone()
+            }
+            SymbolicExpression::BinaryOperation(lhs, BinaryOperator::Sub, rhs, _) => {
+                SymbolicExpression::BinaryOperation(
+                    rhs.clone(),
+                    BinaryOperator::Sub,
+                    lhs.clone(),
+                    self.range_constraint().multiple(-T::from(1)),
+                )
+            }
+            SymbolicExpression::BinaryOperation(lhs, BinaryOperator::Mul, rhs, _)
+                if matches!(**lhs, SymbolicExpression::Concrete(_)) =>
+            {
+                SymbolicExpression::BinaryOperation(
+                    Arc::new(-(**lhs).clone()),
+                    BinaryOperator::Mul,
+                    rhs.clone(),
+                    self.range_constraint().multiple(-T::from(1)),
+                )
+            }
+            SymbolicExpression::BinaryOperation(lhs, BinaryOperator::Mul, rhs, _)
+                if matches!(**rhs, SymbolicExpression::Concrete(_)) =>
+            {
+                SymbolicExpression::BinaryOperation(
+                    lhs.clone(),
+                    BinaryOperator::Mul,
+                    Arc::new(-(**rhs).clone()),
+                    self.range_constraint().multiple(-T::from(1)),
+                )
             }
             _ => SymbolicExpression::UnaryOperation(
                 UnaryOperator::Neg,
@@ -275,8 +376,14 @@ impl<T: FieldElement, V: Clone> Mul for SymbolicExpression<T, V> {
     }
 }
 
+impl<T: FieldElement, V: Clone> MulAssign for SymbolicExpression<T, V> {
+    fn mul_assign(&mut self, rhs: Self) {
+        *self = self.clone() * rhs;
+    }
+}
+
 impl<T: FieldElement, V: Clone> SymbolicExpression<T, V> {
-    /// Field element division. See `integer_div` for integer division.
+    /// Field element division.
     /// If you use this, you must ensure that the divisor is not zero.
     pub fn field_div(&self, rhs: &Self) -> Self {
         if let (SymbolicExpression::Concrete(a), SymbolicExpression::Concrete(b)) = (self, rhs) {
@@ -296,38 +403,6 @@ impl<T: FieldElement, V: Clone> SymbolicExpression<T, V> {
                 Arc::new(rhs.clone()),
                 Default::default(),
             )
-        }
-    }
-
-    /// Integer division, i.e. convert field elements to unsigned integer and divide.
-    pub fn integer_div(&self, rhs: &Self) -> Self {
-        if let (SymbolicExpression::Concrete(a), SymbolicExpression::Concrete(b)) = (self, rhs) {
-            assert!(b != &T::from(0));
-            SymbolicExpression::Concrete(*a / *b)
-        } else if rhs.is_known_one() {
-            self.clone()
-        } else {
-            SymbolicExpression::BinaryOperation(
-                Arc::new(self.clone()),
-                BinaryOperator::IntegerDiv,
-                Arc::new(rhs.clone()),
-                Default::default(),
-            )
-        }
-    }
-}
-
-impl<T: FieldElement, V: Clone> BitAnd<T::Integer> for SymbolicExpression<T, V> {
-    type Output = SymbolicExpression<T, V>;
-
-    fn bitand(self, rhs: T::Integer) -> Self::Output {
-        if let SymbolicExpression::Concrete(a) = self {
-            SymbolicExpression::Concrete(T::from(a.to_integer() & rhs))
-        } else if self.is_known_zero() || rhs.is_zero() {
-            SymbolicExpression::Concrete(T::from(0))
-        } else {
-            let rc = RangeConstraint::from_mask(*self.range_constraint().mask() & rhs);
-            SymbolicExpression::BitOperation(Arc::new(self), BitOperator::And, rhs, rc)
         }
     }
 }

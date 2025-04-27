@@ -16,7 +16,6 @@ use crate::witgen::global_constraints::RangeConstraintSet;
 use crate::witgen::jit::function_cache::FunctionCache;
 use crate::witgen::jit::witgen_inference::CanProcessCall;
 use crate::witgen::processor::{OuterQuery, Processor, SolverState};
-use crate::witgen::range_constraints::RangeConstraint;
 use crate::witgen::rows::{Row, RowIndex};
 use crate::witgen::sequence_iterator::{
     DefaultSequenceIterator, ProcessingSequenceCache, ProcessingSequenceIterator,
@@ -25,7 +24,9 @@ use crate::witgen::util::try_to_simple_poly;
 use crate::witgen::AffineExpression;
 use crate::witgen::{machines::Machine, EvalError, EvalValue, IncompleteCause, QueryCallback};
 use bit_vec::BitVec;
+
 use powdr_ast::analyzed::{DegreeRange, PolyID, PolynomialType};
+use powdr_constraint_solver::range_constraint::RangeConstraint;
 use powdr_number::{DegreeType, FieldElement};
 
 enum ProcessResult<'a, T: FieldElement> {
@@ -393,6 +394,13 @@ impl<'a, T: FieldElement> Machine<'a, T> for BlockMachine<'a, T> {
             .map(|(id, values)| (self.fixed_data.column_name(&id).to_string(), values))
             .collect()
     }
+
+    fn take_public_values(&mut self) -> BTreeMap<String, T> {
+        std::mem::take(&mut self.publics)
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect()
+    }
 }
 
 impl<'a, T: FieldElement> BlockMachine<'a, T> {
@@ -442,7 +450,7 @@ impl<'a, T: FieldElement> BlockMachine<'a, T> {
         log::trace!("Left values of lookup:");
         if log::log_enabled!(log::Level::Trace) {
             for l in arguments {
-                log::trace!("  {}", l);
+                log::trace!("  {l}");
             }
         }
 
@@ -464,6 +472,10 @@ impl<'a, T: FieldElement> BlockMachine<'a, T> {
             assert!(updates.is_complete());
             self.block_count_jit += 1;
             return Ok(updates);
+        }
+
+        if T::known_field() == Some(powdr_number::KnownField::GoldilocksField) {
+            return Ok(EvalValue::incomplete(IncompleteCause::SolvingFailed));
         }
 
         let outer_query = OuterQuery::new(

@@ -5,6 +5,7 @@ use bit_vec::BitVec;
 use dynamic_machine::DynamicMachine;
 use powdr_ast::analyzed::{self, ContainsNextRef, DegreeRange, PolyID};
 
+use powdr_constraint_solver::range_constraint::RangeConstraint;
 use powdr_number::DegreeType;
 use powdr_number::FieldElement;
 
@@ -22,7 +23,6 @@ use self::write_once_memory::WriteOnceMemory;
 use super::data_structures::identity::{BusReceive, Identity};
 use super::global_constraints::RangeConstraintSet;
 use super::jit::witgen_inference::CanProcessCall;
-use super::range_constraints::RangeConstraint;
 use super::{AffineExpression, AlgebraicVariable, EvalError, EvalResult, FixedData, QueryCallback};
 
 mod block_machine;
@@ -142,6 +142,10 @@ pub trait Machine<'a, T: FieldElement>: Send + Sync {
 
     /// Returns the identity IDs of the connecting identities that this machine is responsible for.
     fn bus_ids(&self) -> Vec<T>;
+
+    fn take_public_values(&mut self) -> BTreeMap<String, T> {
+        BTreeMap::new()
+    }
 }
 
 #[repr(C)]
@@ -237,6 +241,10 @@ impl<'a, T: FieldElement> Machine<'a, T> for KnownMachine<'a, T> {
         mutable_state: &'b MutableState<'a, T, Q>,
     ) -> HashMap<String, Vec<T>> {
         match_variant!(self, m => m.take_witness_col_values(mutable_state))
+    }
+
+    fn take_public_values(&mut self) -> BTreeMap<String, T> {
+        match_variant!(self, m => m.take_public_values())
     }
 
     fn bus_ids(&self) -> Vec<T> {

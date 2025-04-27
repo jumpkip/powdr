@@ -11,16 +11,15 @@ use crate::witgen::global_constraints::RangeConstraintSet;
 use crate::witgen::jit::witgen_inference::CanProcessCall;
 use crate::witgen::machines::compute_size_and_log;
 use crate::witgen::processor::OuterQuery;
-use crate::witgen::range_constraints::RangeConstraint;
 use crate::witgen::util::try_to_simple_poly;
 use crate::witgen::{
     AffineExpression, AlgebraicVariable, EvalError, EvalResult, EvalValue, FixedData,
     IncompleteCause, QueryCallback,
 };
 
-use powdr_number::{DegreeType, FieldElement, LargeInt};
-
 use powdr_ast::analyzed::{DegreeRange, PolyID};
+use powdr_constraint_solver::range_constraint::RangeConstraint;
+use powdr_number::{DegreeType, FieldElement, LargeInt};
 
 /// If all witnesses of a machine have a name in this list (disregarding the namespace),
 /// we'll consider it to be a double-sorted machine.
@@ -461,11 +460,7 @@ impl<T: FieldElement> DoubleSortedWitnesses32<'_, T> {
                 LookupCell::Output(_) => return Ok(false),
             };
 
-            log::trace!(
-                "Memory write: addr={:x}, step={step}, value={:x}",
-                addr,
-                value
-            );
+            log::trace!("Memory write: addr={addr:x}, step={step}, value={value:x}");
             self.data.write(*addr, *value);
             self.trace
                 .insert(
@@ -480,11 +475,7 @@ impl<T: FieldElement> DoubleSortedWitnesses32<'_, T> {
                 .is_none()
         } else {
             let value = self.data.read(*addr);
-            log::trace!(
-                "Memory read: addr={:x}, step={step}, value={:x}",
-                addr,
-                value
-            );
+            log::trace!("Memory read: addr={addr:x}, step={step}, value={value:x}");
             match value_ptr {
                 LookupCell::Input(v) => {
                     if *v != &value {

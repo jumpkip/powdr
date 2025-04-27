@@ -6,6 +6,10 @@ use powdr_ast::{
     analyzed::{PolyID, PolynomialType},
     indent,
 };
+use powdr_constraint_solver::{
+    effect::{Assertion, BitDecomposition, BitDecompositionComponent, Condition},
+    symbolic_expression::{BinaryOperator, SymbolicExpression, UnaryOperator},
+};
 use powdr_jit_compiler::{util_code::util_code, CodeGenerator, DefinitionFetcher};
 use powdr_number::FieldElement;
 
@@ -23,13 +27,12 @@ use crate::witgen::{
 };
 
 use super::{
-    effect::{Assertion, BranchCondition, Effect, ProverFunctionCall},
+    effect::{Effect, ProverFunctionCall},
     prover_function_heuristics::ProverFunction,
-    symbolic_expression::{BinaryOperator, BitOperator, SymbolicExpression, UnaryOperator},
     variable::Variable,
 };
 
-pub struct WitgenFunction<T> {
+pub struct CompiledFunction<T> {
     // TODO We might want to pass arguments as direct function parameters
     // (instead of a struct), so that
     // they are stored in registers instead of the stack. Should be checked.
@@ -37,11 +40,7 @@ pub struct WitgenFunction<T> {
     _library: Arc<Library>,
 }
 
-impl<T: FieldElement> WitgenFunction<T> {
-    /// Call the witgen function to fill the data and "known" tables
-    /// given a slice of parameters.
-    /// The `row_offset` is the index inside `data` of the row considered to be "row zero".
-    /// This function always succeeds (unless it panics).
+impl<T: FieldElement> CompiledFunction<T> {
     pub fn call<Q: QueryCallback<T>>(
         &self,
         fixed_data: &FixedData<'_, T>,
@@ -51,7 +50,7 @@ impl<T: FieldElement> WitgenFunction<T> {
     ) {
         let row_offset = data.row_offset.try_into().unwrap();
         let (data, known) = data.as_mut_slices();
-        (self.function)(WitgenFunctionParams {
+        let params = WitgenFunctionParams {
             data: data.into(),
             known: known.as_mut_ptr(),
             row_offset,
@@ -62,7 +61,8 @@ impl<T: FieldElement> WitgenFunction<T> {
             get_fixed_value: get_fixed_value::<T>,
             input_from_channel: input_from_channel::<T, Q>,
             output_to_channel: output_to_channel::<T, Q>,
-        });
+        };
+        (self.function)(params);
     }
 }
 
@@ -119,7 +119,7 @@ pub fn compile_effects<T: FieldElement, D: DefinitionFetcher>(
     known_inputs: &[Variable],
     effects: &[Effect<T, Variable>],
     prover_functions: Vec<ProverFunction<'_, T>>,
-) -> Result<WitgenFunction<T>, String> {
+) -> Result<CompiledFunction<T>, String> {
     let utils = util_code::<T>()?;
     let interface = interface_code(column_layout);
     let mut codegen = CodeGenerator::<T, _>::new(definitions);
@@ -153,7 +153,7 @@ pub fn compile_effects<T: FieldElement, D: DefinitionFetcher>(
 
     let library = Arc::new(unsafe { libloading::Library::new(&lib_path.path).unwrap() });
     let witgen_fun = unsafe { library.get(b"witgen\0") }.unwrap();
-    Ok(WitgenFunction {
+    Ok(CompiledFunction {
         function: *witgen_fun,
         _library: library,
     })
@@ -262,11 +262,7 @@ fn witgen_code<T: FieldElement>(
         .format("\n");
 
     let main_code = format_effects(effects);
-    let vars_known = effects
-        .iter()
-        .flat_map(Effect::written_vars)
-        .map(|(var, _)| var)
-        .collect_vec();
+    let vars_known = effects.iter().flat_map(Effect::written_vars).collect_vec();
     let store_values = vars_known
         .iter()
         .filter_map(|var| {
@@ -371,6 +367,9 @@ fn format_effect<T: FieldElement>(effect: &Effect<T, Variable>, is_top_level: bo
                 format_expression(e)
             )
         }
+        Effect::BitDecomposition(BitDecomposition { value, components }) => {
+            format_bit_decomposition(is_top_level, value, components)
+        }
         Effect::RangeConstraint(..) => {
             unreachable!("Final code should not contain pure range constraints.")
         }
@@ -433,13 +432,9 @@ fn format_effect<T: FieldElement>(effect: &Effect<T, Variable>, is_top_level: bo
                     .flat_map(|e| e.written_vars())
                     .sorted()
                     .dedup()
-                    .map(|(v, needs_mut)| {
+                    .map(|v| {
                         let v = variable_to_string(v);
-                        if needs_mut {
-                            format!("let mut {v} = FieldElement::default();\n")
-                        } else {
-                            format!("let {v};\n")
-                        }
+                        format!("let mut {v} = FieldElement::default();\n")
                     })
                     .format("")
                     .to_string()
@@ -474,7 +469,6 @@ fn format_expression<T: FieldElement>(e: &SymbolicExpression<T, Variable>) -> St
                 BinaryOperator::Sub => format!("({left} - {right})"),
                 BinaryOperator::Mul => format!("({left} * {right})"),
                 BinaryOperator::Div => format!("({left} / {right})"),
-                BinaryOperator::IntegerDiv => format!("integer_div({left}, {right})"),
             }
         }
         SymbolicExpression::UnaryOperation(op, inner, _) => {
@@ -483,27 +477,65 @@ fn format_expression<T: FieldElement>(e: &SymbolicExpression<T, Variable>) -> St
                 UnaryOperator::Neg => format!("-{inner}"),
             }
         }
-        SymbolicExpression::BitOperation(left, op, right, _) => {
-            let left = format_expression(left);
-            match op {
-                BitOperator::And => format!("({left} & {right:#x})"),
-            }
-        }
     }
 }
 
-fn format_condition<T: FieldElement>(
-    BranchCondition {
-        variable,
-        condition,
-    }: &BranchCondition<T, Variable>,
+fn format_bit_decomposition<T: FieldElement>(
+    is_top_level: bool,
+    value: &SymbolicExpression<T, Variable>,
+    components: &[BitDecompositionComponent<T, Variable>],
 ) -> String {
-    let var = format!("IntType::from({})", variable_to_string(variable));
+    let mut result = format!("let bit_decomp_value = {};\n", format_expression(value));
+
+    // The components need to be sorted so that carry propagates correctly.
+    let components = components
+        .iter()
+        .sorted_by_key(|c| c.exponent)
+        .collect_vec();
+    // If no component is negative, we can assume that the value is unsigned
+    // which makes some functions much easier.
+    let signed = if components.iter().any(|c| c.is_negative) {
+        "signed"
+    } else {
+        "unsigned"
+    };
+    for BitDecompositionComponent {
+        variable,
+        is_negative,
+        exponent,
+        bit_mask,
+    } in components
+    {
+        assert!(*bit_mask != 0.into());
+        result.push_str(&format!(
+            "let bit_decomp_component = bitand_{signed}({}bit_decomp_value, 0x{bit_mask:0x});\n",
+            if *is_negative { "-" } else { "" },
+        ));
+
+        result.push_str(&format!(
+            "{}{} = unsigned_shift(bit_decomp_component, {exponent});\n",
+            if is_top_level { "let " } else { "" },
+            variable_to_string(variable)
+        ));
+        result.push_str(&format!(
+            "let bit_decomp_value = bit_decomp_value {} bit_decomp_component;\n",
+            // Inverted because we remove the extracted value.
+            if *is_negative { "+" } else { "-" },
+        ));
+    }
+    result.push_str("assert!(bit_decomp_value == FieldElement::from(0));\n");
+    result
+}
+
+fn format_condition<T: FieldElement>(
+    Condition { value, condition }: &Condition<T, Variable>,
+) -> String {
+    let value = format!("IntType::from({})", format_expression(value));
     let (min, max) = condition.range();
     match min.cmp(&max) {
-        Ordering::Equal => format!("{var} == {min}",),
-        Ordering::Less => format!("{min} <= {var} && {var} <= {max}"),
-        Ordering::Greater => format!("{var} <= {min} || {var} >= {max}"),
+        Ordering::Equal => format!("{value} == {min}",),
+        Ordering::Less => format!("{{ let v = {value}; {min} <= v && v <= {max} }}"),
+        Ordering::Greater => format!("{{ let v = {value}; v <= {min} || v >= {max} }}"),
     }
 }
 
@@ -637,6 +669,7 @@ mod tests {
 
     use powdr_ast::analyzed::AlgebraicReference;
     use powdr_ast::analyzed::FunctionValueDefinition;
+    use powdr_constraint_solver::range_constraint::RangeConstraint;
     use pretty_assertions::assert_eq;
     use test_log::test;
 
@@ -645,7 +678,6 @@ mod tests {
     use crate::witgen::jit::prover_function_heuristics::QueryType;
     use crate::witgen::jit::variable::Cell;
     use crate::witgen::jit::variable::MachineCallVariable;
-    use crate::witgen::range_constraints::RangeConstraint;
 
     use super::*;
 
@@ -660,7 +692,7 @@ mod tests {
         column_count: usize,
         known_inputs: &[Variable],
         effects: &[Effect<GoldilocksField, Variable>],
-    ) -> Result<WitgenFunction<GoldilocksField>, String> {
+    ) -> Result<CompiledFunction<GoldilocksField>, String> {
         super::compile_effects(
             &NoDefinitions,
             ColumnLayout {
@@ -955,29 +987,6 @@ extern \"C\" fn witgen(
     }
 
     #[test]
-    fn integer_division() {
-        let x = cell("x", 0, 0);
-        let y = cell("y", 1, 0);
-        let z = cell("z", 2, 0);
-        let effects = vec![
-            assignment(&y, symbol(&x).integer_div(&number(10))),
-            assignment(&z, symbol(&x).integer_div(&-number(10))),
-        ];
-        let known_inputs = vec![x.clone()];
-        let f = compile_effects(3, &known_inputs, &effects).unwrap();
-        let mut data = vec![
-            GoldilocksField::from(23),
-            GoldilocksField::from(0),
-            GoldilocksField::from(0),
-        ];
-        let mut known = vec![0; 1];
-        (f.function)(witgen_fun_params(&mut data, &mut known));
-        assert_eq!(data[0], GoldilocksField::from(23));
-        assert_eq!(data[1], GoldilocksField::from(2));
-        assert_eq!(data[2], GoldilocksField::from(0));
-    }
-
-    #[test]
     fn input_output() {
         let x = param(0);
         let y = param(1);
@@ -994,20 +1003,73 @@ extern \"C\" fn witgen(
     }
 
     #[test]
-    fn bit_ops() {
-        let a = cell("a", 0, 0);
-        let x = cell("x", 1, 0);
-        // Test that the operators & and | work with numbers larger than the modulus.
-        let large_num =
-            <powdr_number::GoldilocksField as powdr_number::FieldElement>::Integer::from(
-                0xffffffffffffffff_u64,
-            );
-        assert!(large_num.to_string().parse::<u64>().unwrap() == 0xffffffffffffffff_u64);
-        assert!(large_num > GoldilocksField::modulus());
-        let effects = vec![assignment(&x, symbol(&a) & large_num)];
-        let known_inputs = vec![a.clone()];
-        let code = witgen_code(&known_inputs, &effects);
-        assert!(code.contains(&format!("let c_x_1_0 = (c_a_0_0 & {large_num:#x});")));
+    fn bit_decomposition() {
+        let x = param(0);
+        let a = param(1);
+        let b = param(2);
+        let c = param(3);
+        let x_val: GoldilocksField = 0x1f202.into();
+        let mut a_val: GoldilocksField = 9.into();
+        let mut b_val: GoldilocksField = 9.into();
+        let mut c_val: GoldilocksField = 9.into();
+        let effects = vec![Effect::BitDecomposition(BitDecomposition {
+            value: symbol(&x),
+            components: vec![
+                BitDecompositionComponent {
+                    variable: a.clone(),
+                    is_negative: false,
+                    exponent: 16,
+                    bit_mask: 0xff0000u64.into(),
+                },
+                BitDecompositionComponent {
+                    variable: b.clone(),
+                    is_negative: true,
+                    exponent: 8,
+                    bit_mask: 0xff00u64.into(),
+                },
+                BitDecompositionComponent {
+                    variable: c.clone(),
+                    is_negative: false,
+                    exponent: 0,
+                    bit_mask: 0xffu64.into(),
+                },
+            ],
+        })];
+        let f = compile_effects(1, &[x], &effects).unwrap();
+        let mut data = vec![];
+        let mut known = vec![];
+        let mut params = vec![
+            LookupCell::Input(&x_val),
+            LookupCell::Output(&mut a_val),
+            LookupCell::Output(&mut b_val),
+            LookupCell::Output(&mut c_val),
+        ];
+        let params = witgen_fun_params_with_params(&mut data, &mut known, &mut params);
+        (f.function)(params);
+        assert_eq!(a_val, GoldilocksField::from(2));
+        assert_eq!(b_val, GoldilocksField::from(0x100 - 0xf2));
+        assert_eq!(c_val, GoldilocksField::from(2));
+        assert_eq!(
+            GoldilocksField::from(0x1f202),
+            a_val * GoldilocksField::from(0x10000) - b_val * GoldilocksField::from(0x100) + c_val
+        );
+
+        let x_val = -GoldilocksField::from(0x808);
+        let mut params = vec![
+            LookupCell::Input(&x_val),
+            LookupCell::Output(&mut a_val),
+            LookupCell::Output(&mut b_val),
+            LookupCell::Output(&mut c_val),
+        ];
+        let params = witgen_fun_params_with_params(&mut data, &mut known, &mut params);
+        (f.function)(params);
+        assert_eq!(a_val, GoldilocksField::from(0));
+        assert_eq!(b_val, GoldilocksField::from(9));
+        assert_eq!(c_val, GoldilocksField::from(0xf8));
+        assert_eq!(
+            -GoldilocksField::from(0x808),
+            a_val * GoldilocksField::from(0x10000) - b_val * GoldilocksField::from(0x100) + c_val
+        );
     }
 
     #[test]
@@ -1097,8 +1159,8 @@ extern \"C\" fn witgen(
         let mut x_val: GoldilocksField = 7.into();
         let mut y_val: GoldilocksField = 9.into();
         let effects = vec![Effect::Branch(
-            BranchCondition {
-                variable: x.clone(),
+            Condition {
+                value: SymbolicExpression::from_symbol(x.clone(), Default::default()),
                 condition: RangeConstraint::from_range(7.into(), 20.into()),
             },
             vec![assignment(&y, symbol(&x) + number(1))],
@@ -1126,24 +1188,24 @@ extern \"C\" fn witgen(
         let y = param(1);
         let z = param(2);
         let branch_effect = Effect::Branch(
-            BranchCondition {
-                variable: x.clone(),
+            Condition {
+                value: SymbolicExpression::from_symbol(x.clone(), Default::default()),
                 condition: RangeConstraint::from_range(7.into(), 20.into()),
             },
             vec![assignment(&y, symbol(&x) + number(1))],
             vec![Effect::Branch(
-                BranchCondition {
-                    variable: z.clone(),
+                Condition {
+                    value: SymbolicExpression::from_symbol(z.clone(), Default::default()),
                     condition: RangeConstraint::from_range(7.into(), 20.into()),
                 },
                 vec![assignment(&y, symbol(&x) + number(2))],
                 vec![assignment(&y, symbol(&x) + number(3))],
             )],
         );
-        let expectation = "    let p_1;
-    if 7 <= IntType::from(p_0) && IntType::from(p_0) <= 20 {
+        let expectation = "    let mut p_1 = FieldElement::default();
+    if { let v = IntType::from(p_0); 7 <= v && v <= 20 } {
         p_1 = (p_0 + FieldElement::from(1));
-    } else if 7 <= IntType::from(p_2) && IntType::from(p_2) <= 20 {
+    } else if { let v = IntType::from(p_2); 7 <= v && v <= 20 } {
         p_1 = (p_0 + FieldElement::from(2));
     } else {
         p_1 = (p_0 + FieldElement::from(3));
