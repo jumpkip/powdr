@@ -67,6 +67,11 @@ impl<T: FieldElement> RangeConstraint<T> {
         Self::from_mask(!T::Integer::zero())
     }
 
+    pub fn is_unconstrained(&self) -> bool {
+        self.range_width() == Self::unconstrained().range_width()
+            && self.mask == Self::unconstrained().mask
+    }
+
     /// Returns a bit mask. This might be drastically under-fitted in case
     /// the constraint is more resembling an interval.
     /// Semantics: X & mask == X holds for all possible values of X.
@@ -148,7 +153,11 @@ impl<T: FieldElement> RangeConstraint<T> {
 
     /// The range constraint of the product of two expressions.
     pub fn combine_product(&self, other: &Self) -> Self {
-        if self.min <= self.max
+        if let Some(v) = other.try_to_single_value() {
+            self.multiple(v)
+        } else if let Some(v) = self.try_to_single_value() {
+            other.multiple(v)
+        } else if self.min <= self.max
             && other.min <= other.max
             && self.max.to_arbitrary_integer() * other.max.to_arbitrary_integer()
                 < T::modulus().to_arbitrary_integer()
@@ -255,6 +264,15 @@ impl<T: FieldElement> RangeConstraint<T> {
         let intervals_disjoint =
             interval_intersection((self.min, self.max), (other.min, other.max)).is_none();
         masks_disjoint || intervals_disjoint
+    }
+
+    /// Returns the allowed values of this range constraint.
+    /// Panics if the range width is larger than 2^32 (in which case you
+    /// probably don't want to call this function).
+    pub fn allowed_values(&self) -> impl Iterator<Item = T> + '_ {
+        (0..=self.range_width().try_into_u32().unwrap())
+            .map(move |offset| self.min + T::from(offset))
+            .filter(|value| self.allows_value(*value))
     }
 }
 

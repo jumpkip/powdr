@@ -143,7 +143,7 @@ impl Session {
 
     pub fn with_backend(self, backend: backend::BackendType) -> Self {
         Session {
-            pipeline: self.pipeline.with_backend(backend, None),
+            pipeline: self.pipeline.with_backend(backend),
             ..self
         }
     }
@@ -254,8 +254,8 @@ impl Session {
         let pubs: Vec<u32> = self
             .pipeline
             .publics()
-            .iter()
-            .map(|(_, v)| v.unwrap().to_integer().try_into_u32().unwrap())
+            .values()
+            .map(|v| v.unwrap().to_integer().try_into_u32().unwrap())
             .collect();
         pubs.try_into().expect("There should be exactly 8 publics")
     }

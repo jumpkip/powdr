@@ -3,6 +3,8 @@ use std::fmt::{self, Display, Formatter, Write};
 use itertools::Itertools;
 use powdr_ast::analyzed::{AlgebraicExpression, PolynomialIdentity};
 use powdr_constraint_solver::range_constraint::RangeConstraint;
+use powdr_constraint_solver::symbolic_expression::SymbolicExpression;
+use powdr_constraint_solver::variable_update::UpdateKind;
 use powdr_constraint_solver::{
     quadratic_symbolic_expression::{self, QuadraticSymbolicExpression},
     variable_update::VariableUpdate,
@@ -83,6 +85,7 @@ impl<'a, T: FieldElement> Processor<'a, T> {
         self
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn generate_code<FixedEval: FixedEvaluator<T>>(
         self,
         can_process: impl CanProcessCall<T>,
@@ -123,6 +126,7 @@ impl<'a, T: FieldElement> Processor<'a, T> {
         self.generate_code_for_branch(can_process, witgen, identity_queue, branch_depth)
     }
 
+    #[allow(clippy::result_large_err)]
     fn generate_code_for_branch<FixedEval: FixedEvaluator<T>>(
         &self,
         can_process: impl CanProcessCall<T>,
@@ -620,14 +624,18 @@ pub fn algebraic_variable_equation_to_queue_items<'b, T: FieldElement>(
 fn variable_update<T: FieldElement>(
     variable: Variable,
     witgen: &WitgenInference<'_, T, impl FixedEvaluator<T>>,
-) -> VariableUpdate<T, Variable> {
-    let known = witgen.is_known(&variable);
+) -> VariableUpdate<T, Variable, SymbolicExpression<T, Variable>> {
     let range_constraint = witgen.range_constraint(&variable);
-    VariableUpdate {
-        variable,
-        known,
-        range_constraint,
-    }
+    let update = if witgen.is_known(&variable) {
+        // If the variable got known, we replace it by a known symbolic expresison.
+        UpdateKind::Replace(SymbolicExpression::from_symbol(
+            variable.clone(),
+            range_constraint,
+        ))
+    } else {
+        UpdateKind::RangeConstraintUpdate(range_constraint)
+    };
+    VariableUpdate { variable, update }
 }
 
 fn is_machine_call<T>(identity: &Identity<T>) -> bool {

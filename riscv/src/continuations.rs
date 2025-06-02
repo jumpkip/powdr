@@ -12,11 +12,11 @@ use powdr_pipeline::Pipeline;
 use powdr_riscv_executor::{
     get_main_machine, hash_map_to_memory_state, MemoryState, ProfilerOptions,
 };
+use powdr_riscv_types::{Register, REGISTER_MEMORY_NAMES, REGISTER_NAMES};
 
 pub mod bootloader;
 mod memory_merkle_tree;
 
-use crate::code_gen::{REGISTER_MEMORY_NAMES, REGISTER_NAMES};
 use bootloader::split_fe;
 use bootloader::{default_input, PAGE_SIZE_BYTES_LOG, PC_INDEX};
 use memory_merkle_tree::MerkleTree;
@@ -26,8 +26,6 @@ use crate::continuations::bootloader::{
     bootloader_size, default_register_values, BOOTLOADER_INPUTS_PER_PAGE, DEFAULT_PC,
     MEMORY_HASH_START_INDEX, PAGE_INPUTS_OFFSET, WORDS_PER_PAGE,
 };
-
-use crate::code_gen::Register;
 
 fn render_memory_hash<F: FieldElement>(hash: &[F]) -> String {
     // Main memory values must fit into u32
@@ -48,7 +46,7 @@ fn render_memory_hash<F: FieldElement>(hash: &[F]) -> String {
 /// # Arguments
 /// - `pipeline`: The pipeline that should be the starting point for all the chunks.
 /// - `pipeline_callback`: A function that will be called for each chunk. It will be passed a prepared `pipeline`,
-///    with all chunk-specific information set (witness, fixed cols, inputs, optimized pil)
+///   with all chunk-specific information set (witness, fixed cols, inputs, optimized pil)
 /// - `bootloader_inputs`: The inputs to the bootloader and the index of the row at which the shutdown routine
 ///   is supposed to execute, for each chunk, as returned by `rust_continuations_dry_run`.
 pub fn rust_continuations<F: FieldElement, PipelineCallback, E>(
